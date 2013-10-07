@@ -1,0 +1,181 @@
+---
+layout: article
+title:  "Disaster Recovery in MySQL using Delayed Replication"
+description: "How to setup a delayed MySQL slave so that you can recover from even the most monumental of mind farts"
+date:   2013-10-02 11:00:22
+categories: mysql replication
+---
+
+<h2>Problem Scenario</h2>
+<p class="lead">FFFFFFFUUUUUUUUUUUU!!! You’ve accidentally updated all records in the payments table to a 0 amount because you forgot to bracket part of your <em>WHERE</em> statement. The table has about 100 million records in it so the query is running right now and it’s going to take a while. Uh-oh!</p>
+<p>If you’re really lucky you can login to the db with the correct permissions and kill the query in time and everything will be ok. Or at least you may be in time to kill it before it's written to the binlog and promote one of your other slave dbs. If that happens then awesome, but what if you’re too late and it’s in your binlog and all of slaves, including your backup slaves? Now you have a nasty corrupted table and once your caching layer starts to invalidate your users are going to start to notice. Dang.</p>
+
+<h2>The Solution &ndash; A delayed slave</h2>
+<p>Now, in MySQL 5.6, <a href="http://dev.mysql.com/doc/refman/5.6/en/replication-delayed.html">delayed replication is built in</a>, however I was running MySQL 5.5 when I set this up originally so these instructions are a little different to what you might do if you’re running MySQL 5.6. I'll try and write an updated version of this for 5.6 at some point. Fortunately for the 5.5 users among us, the smart folk over at Percona have an amazing toolkit &ndash; Percona Toolkit (formerly Maatkit). The <em>pt-delayed-slave</em> tool does exactly what we need. The slave thread continues to run as normal, writing data from the master binlog to the local relay log, however, the timestamp in the relay log is checked all the time to make sure that queries are not run which are within your delayed time frame.</p>
+<p>I chose to have my slave set at 6 hours behind the master as chances are I will get to a terminal well within 6 hours of someone reporting a problem. In reality we’d be at a computer a lot quicker but the length of delay is something you should think about. Too short a time and you risk the bad query getting to your delayed slave before you can get to it, thus wasting the point of having the delayed slave. Alternatively, you can have your delayed time so long that it take hours for your delayed slave to catch up to where the master was at the time of the error. It’ll take some trialling to see how this works with your site as depending on the traffic on your site, will depend on how long it takes for your delayed slave to catch up.</p>
+
+<h2>Configuring pt-slave-delay</h2>
+<p>First off, you need to get a slave up and running and caught up to your master. There are plenty of good articles on the web for this so I won’t cover that topic here.</p>
+<p>Next, install the pt-slave-delay tool on your machine (<a href="http://www.percona.com/doc/percona-toolkit/2.1/installation.html">http://www.percona.com/doc/percona-toolkit/2.1/installation.html</a>).</p>
+<p>
+You’ll need a user setup on your master which has replication privileges so<br />
+<pre class="prettyprint">GRANT REPLICATION SLAVE ON *.* TO 'delayed_repl'@'master.lan' IDENTIFIED BY 'securepass';</pre>
+This user will now appear in your delayed slave as well, and you’ll want to give that SUPER privileges on the delayed slave only, as the tool needs <code>SUPER</code> to control when to stop reading from the relay log.
+</p>
+<p>We setup a standard startup script for pt-slave-delay to allow us to easily have a handle on starting and stopping the process in /etc/init.d/pt-slave-delay:</p>
+<pre class="prettyprint linenums">
+#!/bin/bash
+#
+# pt-slave-delay    Startup script for the Percona Toolkit - Slave Delay
+#
+# pidfile: /var/run/percona-toolkit/pt-slave-delay.pid
+# config:  /etc/percona-toolkit/pt-slave-delay.conf
+#
+### BEGIN INIT INFO
+# Provides: pt-slave-delay
+# Required-Start: $local_fs $remote_fs $network $named $mysql
+# Required-Stop: $local_fs $remote_fs $network
+# Short-Description: start and stop the Percona Toolkit Slave Delay Tool
+# Description: See /etc/percona-toolkit/pt-slave-delay.conf for configuration
+### END INIT INFO
+
+
+# The pt-slave-delay-tool init script
+function Status()
+{
+if [ $? -eq "0" ]; then
+echo -e "\t\t[OK]"
+else
+echo -e "\t\t[FAILED]"
+fi
+}
+
+case "$1" in
+start)
+
+# If the file doesn't exit, use the original default configuration file.
+if [ ! -r /etc/percona-toolkit/pt-slave-delay.conf ]; then
+echo -en "Refusing to start without config file...."
+exit 1;
+fi
+echo -en "Starting pt-slave-delay:"
+# If the process is already running, output status, then exit
+pid=`pidof perl /usr/bin/pt-slave-delay`
+if [ -n "$pid" ]; then
+if [ "$pid" -ge 0 ]; then
+echo -e "\t\t[FAILED]"
+echo -e "\npt-slave-delay already stated, not starting again"
+$0 status
+exit 1;
+fi
+fi
+
+/usr/bin/pt-slave-delay 1> /dev/null 2> /dev/null
+Status;
+;;
+stop)
+echo -en "Stopping pt-slave-delay:\t\t\t"
+kill `pidof perl /usr/bin/pt-slave-delay` 2> /dev/null
+Status;
+;;
+restart)
+echo "Restarting pt-slave-delay:\t\t"
+$0 stop
+sleep 2
+$0 start
+Status;
+;;
+status)
+pid=`pidof perl /usr/bin/pt-slave-delay`
+if [ -n "$pid" ]; then
+echo -e "\nStatus:\t\t[RUNNING]"
+/usr/bin/pt-slave-delay
+
+exit 1
+fi
+
+echo "pt-slave-delay not running...."
+exit 1
+;;
+*)
+echo "Usage: $0 {start|stop|restart|status}"
+exit 1
+;;
+esac
+</pre>
+<p>Our config file at /etc/percona-toolkit/pt-slave-delay.conf looks like this:</p>
+<pre class="prettyprint linenums">
+delay=6h
+daemonize
+interval=30s
+log=/var/log/mysql/pt-slave-delay.log
+host=localhost
+user=delayed_repl
+password=securepass
+socket=/var/lib/mysql/mysql.sock
+use-master
+nocontinue
+</pre>
+<p>Most of these settings are fairly self explanatory but the one which I highly advise is <code>nocontinue</code>. This basically means if the script gets terminated, it will return the slave to a regular slave and start catching up to the master as soon as possible. In some circumstances that will be useful, but this slave is there for disaster recovery for us. To ensure the script doesn’t die silently we have setup an internal Nagios check so that we can see that the slave is no further than 8 hours behind. Imagine going to your delayed slave for a disaster recover to find it’s not been working for 2 months... bad times.</p>
+
+<p>You can start up the process with <code>/etc/init.d/pt-slave-delay start</code> and then you can tail the log <code>tail -f /var/log/mysql/pt-slave-delay.log</code>. You can also open a new terminal, log into the mysql server and see the Read_Master_Log_Pos increasing in show slave status, whereas the Relay_Log_Pos stays static and the Seconds_Behind_Master is null. When the server gets to be 6 hours behind, the Relay_Log_Pos will start to increase again, keeping at a pace 6 hours behind the master, checking it’s position every 30 seconds, as defined in our config.</p>
+
+<h2>Putting it into practice</h2>
+<p>So our delayed slave is keeping a nice steady pace and we’re reacting to the head thumping going on by the unfortunate developer who ran the bad query. First thing to do is to logon to the box with your delayed slave on it and stop the pt-slave-delay process (<code>/etc/init.d/pt-slave-delay stop</code>). Login to mysql and double check it’s not catching up with a <code>STOP SLAVE;</code> command.</p>
+
+<p>Now you have some time to get some facts together. You need to find out the binlog position of the bad query so you can slave your delayed slave up to it and skip it.</p>
+
+<p>Note: it’s way easier to have your delayed slave pointing directly at the master unless you are using a version of MySQL which supports global query ids. Otherwise you’ll need to find the problem query once for each number of slaves between your delayed slave and the master.</p>
+
+<p>The next task is to find the problem query. Hopefully you’ll know vaguely what time the problem occurred. It won’t be a massive problem if you don’t know, it’ll just take longer to find and to grep through the binlog for the query. Hopefully you also know vaguely what the query will look like, either a TRUNCATE command or look for an update to the affected table(s). List the files in your masters binlog directory (/var/log/mysql/ by default) and look for the file which you think will contain the problem command using this tool:<br />
+
+<pre class="prettyprint">mysqlbinlog --start-datetime="2013-02-03 09:00:00" --stop-datetime="2013-02-01 12:00:00" /var/log/mysql/bin_master.000006 | grep -i -B 25 "UPDATE user_transactions"</pre><br />
+
+The parameters in this command are telling mysqlbinlog to look in the bin_master.000006 file and give me the contents between 09:00 and 12:00 on 3rd Feb 2013. Then pipe that output to grep for a case incensitive search on UPDATE user_transactions. the -B 25 will give us the 25 lines of the file before the UPDATE command as well.</p>
+<pre class="prettyprint linenums">
+SET @@session.collation_database=DEFAULT/*!*/;
+BEGIN
+/*!*/;
+# at 559341672
+#120116 10:35:47 server id 2990516948  end_log_pos 559341785    Query   thread_id=122158    exec_time=0 error_code=0
+use main_db /*!*/;
+SET TIMESTAMP=1326710147/*!*/;
+update user_transactions SET commission=0
+</pre>
+<p>In the bottom few lines of the mysqlbinlog output you should have the erroneous command that was run and below the first BEGIN before your bad command, you’ll have an # at xxxxxxx. This is the binlog position and it’s where we want to slave our delayed slave up to.</p>
+
+<p>
+    Log back into your delayed slave and run this command:<br />
+
+    <pre class="prettyprint">START SLAVE UNTIL MASTER_LOG_FILE = 'bin_master.000006', MASTER_LOG_POS = 559341672;</pre>
+
+    That’ll take some time to run, so keep an eye on it with <code>SHOW SLAVE STATUS</code>. The Seconds_behind_master value will be NULL once caught up. Now you have a choice on how to proceed. Either skip 1 command like so:<br />
+
+    <pre class="prettyprint">SET GLOBAL sql_slave_skip_counter = 1; START SLAVE;</pre>
+
+    Or, if there are multiple commands that should be skipped, you need to find the binlog position of where to continue from. Rather than using the mysqlbinlog script, we can use the SHOW BINLOG EVENTS command which will give us a much clearer view of what is happening.<br />
+
+    <pre class="prettyprint">SHOW BINLOG EVENTS IN 'bin_master.000006' FROM 559341672 LIMIT 10;</pre>
+</p>
+<pre class="prettyprint linenums nowrap">
++-------------------+-----------+------------+------------+-------------+-------------------------------------------------------------------------------------------------------------------------------------+
+| Log_name          | Pos       | Event_type | Server_id  | End_log_pos | Info                                                                                                                                |
++-------------------+-----------+------------+------------+-------------+-------------------------------------------------------------------------------------------------------------------------------------+
+| bin_master.000006 | 559341672 | Query      | 2990516948 |   559341785 | use `my_db`; update user_transactions SET commission=0                                                                              |
+| bin_master.000006 | 559341785 | Query      | 2990516948 |   559341862 | COMMIT                                                                                                                              |
+| bin_master.000006 | 559341862 | Query      | 2990516948 |   559341929 | BEGIN                                                                                                                               |
+| bin_master.000006 | 559341929 | Intvar     | 2990516948 |   559341957 | INSERT_ID=1                                                                                                                         |
+| bin_master.000006 | 559341957 | Query      | 2990516948 |   559342257 | use `my_db`; update user_transactions set user_id = 1                                                                               |
+| bin_master.000006 | 559342257 | Xid        | 2990516948 |   559342284 | COMMIT /* xid=18899 */                                                                                                              |
+| bin_master.000006 | 559342284 | Query      | 2990516948 |   559342351 | BEGIN                                                                                                                               |
+| bin_master.000006 | 559342351 | Query      | 2990516948 |   559342566 | use `my_db`; UPDATE user_sessions SET data = , date_touched = '2013-02-03 10:50:44' WHERE session_id = 'an2o7oj6pn0s3229i3724kq6s2' |
+| bin_master.000006 | 559342566 | Xid        | 2990516948 |   559342593 | COMMIT /* xid=18901 */                                                                                                              |
++-------------------+-----------+------------+------------+-------------+-------------------------------------------------------------------------------------------------------------------------------------+
+</pre>
+<p>
+    Here, we can see there was a second nasty query setting all user_ids to 1, so we best skip that too. The position we want to carry on from is 559342284.<br />
+    <pre class="prettyprint linenums">CHANGE MASTER TO MASTER_LOG_FILE='master.000006', MASTER_LOG_POS=559342284;
+START SLAVE;</pre>
+</p>
+<p>Once again, we allow the slave to catch up to date and then <a href="http://dev.mysql.com/doc/refman/5.5/en/replication-solutions-switch.html">promote the slave to master</a>. How successful this is for you will depend greatly on how badly the corruption has affected other queries. For example, if everyones user_id was set to 1 in the transactions table, subsequent queries may have read from that table and written to perhaps an invoice table, meaning referential integrity would be broken. Either way, I think most people would agree you’re a lot better off having a delayed slave than you are without one.</p>
+
