@@ -1,28 +1,28 @@
 <html lang="en">
-  <head>
-    {% include head.html %}
-  </head>
 
-  <body class="article" screen_capture_injected="true" onload="prettyPrint();">
+<head>
+    {% include head.html %}
+</head>
+
+<body class="article" screen_capture_injected="true" onload="prettyPrint();">
+
+    {% include nav.html %}
 
     <div class="container">
-      <div class="header clearfix">
-        {% include nav.html %}
-        <h3 class="muted-text">Jason Paige</h3>
-      </div>
 
-      <div class="page-header">
-        <h1>{{ page.title }}</h1>
-        <p class="lead">{{ page.description }}</p>
-      </div>
+        <div class="page-header">
+            <h1>{{ page.title }}</h1>
+            <p class="lead">{{ page.description }}</p>
+        </div>
 
-      <article>
-        {{ content }}
-      </article>
+        <article>
+            {{ content }}
+        </article>
 
-      <div class="footer"></div>
+        <div class="footer"></div>
 
     </div>
 
 </body>
+
 </html>
